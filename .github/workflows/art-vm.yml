@@ -3,6 +3,8 @@ name: Automatic Regression Tests in VMs
 on:
   push:
     branches: [master, ci]
+  schedule:
+    - cron: '22 2 * * *'
   workflow_dispatch:
     # Even with defaults, jobs not started via dispatch will only have blank inputs
     inputs:
@@ -29,11 +31,13 @@ jobs:
             vbox: NetBSD/NetBSD-9.1
             confenv: ''
             confflags: ''
+            cache_epoch: 0
           - name: 'ART (illumos32, OpenIndiana, i686)'
             vbox: openindiana/hipster
             confenv: 'CC="gcc -m32 -msse -msse2 -mfpmath=sse"'
             confflags: '--host=i686-pc-solaris2.11'
             art_reg_skip: 'font_nonunicode'
+            cache_epoch: 0
     env:
       VAGRANT_DISABLE_VBOXSYMLINKCREATE: 1
     defaults:
@@ -57,15 +61,69 @@ jobs:
           ' > /tmp/artci/vm-shell
           sudo chmod a+x /tmp/artci/vm-shell
 
-      - name: Fetch and Start VM-Image
+      # actions/cache has restore-keys but does not expose if a fallback was
+      # used. To workaround this use 2 distinct cache steps and conditions.
+      - name: Find Cache Version
+        id: cache_ver
+        shell: bash
+        run: |
+          time="$(echo "($(date +%Y) - 2022) * 366 + $(date +%j)" | bc )"
+          version="$(( time / 122 ))"
+          prevver="$(( version - 1 ))"
+          echo "::set-output name=version::${version}"
+          echo "::set-output name=prevver::${prevver}"
+
+      - name: Retrieve cached Images
+        uses: actions/cache@v3
+        id: cache
+        with:
+          path: package.box
+          key: ${{ matrix.vbox }}-${{ matrix.cache_epoch }}-${{ steps.cache_ver.outputs.version }}
+
+      - name: Fallback to older Cache
+        if:  steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v3
+        id: cache_old
+        with:
+          path: package.box
+          key: ${{ matrix.vbox }}-${{ matrix.cache_epoch }}-${{ steps.cache_ver.outputs.prevver }}
+
+      - name: Determine Cache Plan
+        id: cache_plan
+        shell: bash
+        run: |
+          action="create"
+          if [ "${{ steps.cache.outputs.cache-hit }}" = "true" ] ; then
+            action="use"
+          elif [ "${{ steps.cache_old.outputs.cache-hit }}" = "true" ] ; then
+            action="update"
+          fi
+          echo "Planned Cache Action: $action"
+          echo "::set-output name=action::${action}"
+
+      - name: Create Vagrantfile
         shell: bash
         run: |
           echo '
             Vagrant.configure("2") do |config|
               config.vm.box = "'"${{ matrix.vbox }}"'"
               config.vm.boot_timeout = 6000
+              config.vm.synced_folder ".", "/vagrant", disabled: true
+              config.ssh.insert_key = false
             end
           ' > Vagrantfile
+
+      - name: Cache Use/Update - Start VM-Image
+        if: steps.cache_plan.outputs.action == 'use' || steps.cache_plan.outputs.action == 'update'
+        shell: bash
+        run: |
+          vagrant box add --name "${{ matrix.vbox }}" package.box
+          vagrant up --provider virtualbox
+
+      - name: Cache Create - Fetch and Start VM-Image
+        if: steps.cache_plan.outputs.action == 'create'
+        shell: bash
+        run: |
           (
             # Sometimes this fails with HTTP erorr 429 (too many requests)
             # The exit status is not a godd indicator, so use the status output instead
@@ -92,7 +150,8 @@ jobs:
 
       # The OI image is too old to be able to install dependencies without an upgrade first
       # and while this isn't the case with the NetBSD image (yet), the packages aren't recent either
-      - name: Upgrade System
+      - name: Cache Update/Create -  Upgrade System
+        if: steps.cache_plan.outputs.action == 'create' || steps.cache_plan.outputs.action == 'update'
         run: |
           case "${{ matrix.vbox }}" in
             openindiana/*)
@@ -111,13 +170,17 @@ jobs:
 
       # On OpenIndiana upgrades of base components require a restart, since
       # they'll get installed into a new boot environment not the current one
-      - name: Reboot VM
-        if: startsWith(matrix.vbox, 'openindiana')
+      - name: Cache Update/Create - Reboot VM and Remove old BEs
+        if: (steps.cache_plan.outputs.action == 'create' || steps.cache_plan.outputs.action == 'update') && startsWith(matrix.vbox, 'openindiana')
         shell: bash
         run: |
           vagrant reload
+          vagrant ssh -- '\
+            pfexec beadm list | awk '\''$2 ~ /^-$/ {print $1}'\'' \
+            | xargs -n 1 pfexec beadm destroy -Fs'
 
-      - name: Install Packages
+      - name: Cache Create - Install Packages
+        if: steps.cache_plan.outputs.action == 'create'
         run: |
           case "${{ matrix.vbox }}" in
             openindiana/*)
@@ -192,3 +255,11 @@ jobs:
           cd libass-tests
           ART_REG_SKIP="${{ matrix.art_reg_skip }}" \
           ./run.sh ../libass/compare/compare ../libass/profile/profile
+
+      - name: Cache Update/Create - Package VM
+        if: steps.cache_plan.outputs.action == 'create' || steps.cache_plan.outputs.action == 'update'
+        shell: bash
+        run: |
+          rm -f package.box
+          vagrant ssh -- "rm -fr libass libass-tests"
+          vagrant package --output package.box
