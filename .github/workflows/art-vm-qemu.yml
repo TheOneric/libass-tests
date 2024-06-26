@@ -98,6 +98,7 @@ jobs:
             case "${{ matrix.os_image }}" in
               netbsd)
                 # We'll use the base system's version of gcc
+                sudo pkgin -y update
                 sudo pkgin -y install \
                     mozilla-rootcerts-openssl git nasm \
                     autoconf automake libtool-base pkg-config \
